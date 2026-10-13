@@ -261,6 +261,41 @@ def _create_default_texture(device, width, height):
     return tex
 
 
+# ─── モニター情報 (公開API) ───────────────────────────────────────────────────
+def list_monitors(device_idx: int = 0) -> list[Tuple[int, int, int, int]]:
+    """
+    モニターごとのデスクトップ座標 (left, top, right, bottom) を列挙する。
+
+    region を自前で計算するとき用。D3D11デバイスを作らずDXGIだけで引くので、
+    KetsugeCam の生成前に呼んでもCUDAコンテキストの初期化順序に影響しない。
+
+    Args:
+        device_idx: GPUアダプター番号 (0=メイン)
+    """
+    factory  = _create_dxgi_factory()
+    adapters = _enum_adapters(factory)
+    outputs  = _enum_outputs(adapters[device_idx])
+
+    rects = []
+    for p_out in outputs:
+        desc = DXGI_OUTPUT_DESC()
+        p_out.GetDesc(ctypes.byref(desc))
+        c = desc.DesktopCoordinates
+        rects.append((c.left, c.top, c.right, c.bottom))
+    return rects
+
+
+def monitor_size(output_idx: int = 0, device_idx: int = 0) -> Tuple[int, int]:
+    """
+    モニターの解像度 (width, height) を返す。
+
+    GetSystemMetrics と違い DXGI が報告する実際の複製面サイズなので、
+    DPIスケーリング環境でも region とズレない。
+    """
+    left, top, right, bottom = list_monitors(device_idx)[output_idx]
+    return (right - left, bottom - top)
+
+
 # ─── KetsugeCam ───────────────────────────────────────────────────────────────
 class KetsugeCam:
     """
@@ -431,6 +466,8 @@ class KetsugeCam:
             # Driver API関数シグネチャ設定
             _cuda_driver.cuCtxSetCurrent.restype  = ctypes.c_int
             _cuda_driver.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+            _cuda_driver.cuCtxGetCurrent.restype  = ctypes.c_int
+            _cuda_driver.cuCtxGetCurrent.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
             _cuda_driver.cuGraphicsMapResources.restype  = ctypes.c_int
             _cuda_driver.cuGraphicsMapResources.argtypes = [
                 ctypes.c_uint,      # count
@@ -504,7 +541,17 @@ class KetsugeCam:
     def _to_tensor_cuda(self) -> torch.Tensor:
         """GPU → GPU 直接転送。CPUノータッチ。Driver API統一。"""
         cu = self._cu_driver
-        # 毎フレーム D3D11コンテキストを確実にカレントに設定
+        # 毎フレーム D3D11コンテキストを確実にカレントに設定する。
+        # ただし呼び出し元のコンテキストは退避して最後に戻す:
+        # torchが明示的に作ったストリームは作成時のコンテキスト専用で、
+        # D3D11側のコンテキストがカレントのまま使うと
+        # cudaErrorInvalidResourceHandle になる。grab() の直後に
+        # 同じスレッドで推論する使い方 (ketsugecam.detector 等) のため。
+        prev_ctx = ctypes.c_void_p(0)
+        try:
+            cu.cuCtxGetCurrent(ctypes.byref(prev_ctx))
+        except Exception:
+            prev_ctx = ctypes.c_void_p(0)
         cu.cuCtxSetCurrent(self._cu_ctx.value)
 
         res_val = self._cuda_res.value
@@ -576,6 +623,8 @@ class KetsugeCam:
 
         finally:
             cu.cuGraphicsUnmapResources(1, ctypes.addressof(res_arr), None)
+            if prev_ctx.value and prev_ctx.value != self._cu_ctx.value:
+                cu.cuCtxSetCurrent(prev_ctx)
 
         # BGRA → BGR スライス (ゼロコピー)
         return self._gpu_buf[..., :3]
@@ -623,10 +672,23 @@ class KetsugeCam:
         self._frame_event.clear()
         self._stop_event.clear()
 
-    def get_latest_frame(self, timeout: float = 1.0) -> Optional[torch.Tensor]:
+    def get_latest_frame(self, timeout: float = 1.0,
+                         copy: bool = False) -> Optional[torch.Tensor]:
+        """最新フレームをEvent待機で取得。更新が来なければ直前のフレーム。
+
+        Args:
+            timeout: 新フレームを待つ秒数
+            copy:    True なら専用バッファへコピーして返す。interop時の返り値は
+                     使い回しバッファのビューなので、次のキャプチャで中身が
+                     書き換わる。数フレームにわたって保持する / 表示用にCPUへ
+                     落とすなど、取得後に時間がかかる用途では True にする。
+        """
         self._frame_event.wait(timeout=timeout)
         self._frame_event.clear()
-        return self._latest
+        frame = self._latest
+        if frame is not None and copy:
+            frame = frame.clone()
+        return frame
 
     @property
     def capture_fps(self) -> float:

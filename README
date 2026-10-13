@@ -9,6 +9,91 @@ cam = ketsugecam.create(region=(0, 0, 640, 640))
 frame = cam.grab()  # torch.Tensor [H, W, 3] CUDA uint8 BGR
 ```
 
+## キャプチャ + YOLO検出を丸ごと動かす
+
+```python
+import ketsugecam
+
+ketsugecam.run(
+    capture_size=(416, 416),   # キャプチャする大きさ (幅, 高さ)。画面中央から
+    model_path="best.engine",  # YOLOモデルのパス
+    detect=True,               # YOLO検出を使う / 使わない
+    show_window=True,          # 画面表示オン / オフ
+    draw_boxes=True,           # 検出枠を描く / 描かない
+    show_fps=True,             # FPS表示オン / オフ
+)
+```
+
+INSERT (またはプレビュー上で ESC) で終了。全部省略可で、省略すると同梱の
+`best.engine` を416x416で検出・表示する。
+
+`python -m ketsugecam` はこれを `__main__.py` 冒頭の6行から呼ぶだけのもの。
+設定を変えたいときはそのファイルの定数を書き換える。
+
+```bash
+python -m ketsugecam
+```
+
+### 公開するのはこの6つだけ
+
+クラス名・しきい値 (0.25)・NMS (0.65)・精度 (FP16)・top-k (100)・モデル
+バージョン判定・前処理・CUDAグラフ・スレッド構成は ketsugecam 内部に内蔵:
+
+- **クラス名**はモデルのメタデータ (Ultralyticsが書き込むJSON) から自動で読む。
+  無ければ出力チャンネル数から連番を振る
+- **モデルバージョン** (v8 / v11 / v26) はファイル名と出力形状から自動判別
+- 既定値を変えたいときは `ketsugecam/detect.py` の `YoloConfig`
+
+`detect=False` のときは TensorRT を一切読み込まないので、キャプチャだけ使う
+用途ならモデルもopencvも不要。
+
+### 検出だけ借りて、ループと表示は自分で書く
+
+```python
+import ketsugecam
+
+cam   = ketsugecam.create(region=(752, 332, 1168, 748))
+model = ketsugecam.detector("best.engine", conf=0.35, iou=0.45, max_det=5)
+cam.start(target_fps=400)
+
+while True:
+    frame = cam.get_latest_frame(copy=True)   # torch.Tensor [H,W,3] uint8 BGR (CUDA)
+    if frame is None:
+        continue
+
+    for d in model.predict(frame):            # 前処理・デコード・NMSは内蔵
+        print(d.xyxy, d.conf, d.cls, d.name, d.center)
+
+    img = frame.cpu().numpy()                 # 表示用だけCPUへ
+    model.draw(img, model.predict(frame))     # 枠・信頼度・中心点を描き込む
+```
+
+`permute` / `float()` / `/255` / BGR→RGB / NMS を自分で書く必要はない。
+`model.predict()` は `torch.Tensor` (CUDA, uint8, BGR) でも numpy の BGR 画像でも
+受け取る。
+
+`copy=True` は interop の返り値が使い回しバッファのビューであるため。取得して
+すぐ推論するだけなら不要だが、表示用にCPUへ落とすなど保持する場合は付ける。
+
+動く例は[リポジトリ直下の `main.py`](../main.py) (検出スレッド + pygame表示)。
+
+### フォルダの中身
+
+| ファイル | 役割 |
+|---|---|
+| `__init__.py` / `ketsugecam.py` / `libs.py` | キャプチャライブラリ本体 |
+| `app.py` | キャプチャ + 検出 + 表示のパイプライン (`run()` の実装) |
+| `detect.py` | TensorRTエンジンと前処理・YOLOデコード |
+| `__main__.py` | `python -m ketsugecam` の設定6行 |
+| `best.engine` | TensorRTエンジン (各自のモデルに差し替え可) |
+| `config.ini` | C++版 `capture_detect.exe` 用の設定。Python側は読まない |
+
+`model_path` の相対パスは **パッケージ内 → カレントディレクトリ** の順に探すので、
+`"best.engine"` ならどこから起動しても `ketsugecam/best.engine` を見つける。
+ONNXを渡した場合、ビルドしたエンジンのキャッシュはモデルと同じ場所に書かれる。
+
+検出・表示の追加要件: `pip install tensorrt opencv-python numpy`
+
 ## 概要
 
 ketsugecamはWindowsのDesktop Duplication APIとCUDA Interopを組み合わせ、**スクリーンキャプチャ結果をCPUを一切介さずGPU上のTensorとして返す**ライブラリです。
@@ -51,21 +136,31 @@ CPUフォールバック時: `Staging Texture → Map → torch.frombuffer → .
 
 ## インストール
 
-```bash
-pip install comtypes torch torchvision --index-url https://download.pytorch.org/whl/cu126
-```
-
-リポジトリをクローンして直接使用:
+PyTorchはCUDAビルドを先に入れる (`pip install ketsugecam` だけだとCPU版が降ってくる):
 
 ```bash
-git clone https://github.com/yourname/ketsugecam.git
+pip install torch --index-url https://download.pytorch.org/whl/cu126
 ```
+
+リポジトリのルート (`pyproject.toml` がある場所) で:
+
+```bash
+pip install -e .      # 編集可能インストール。コードを直せばそのまま反映される
+# または
+pip install .         # site-packagesへコピー
+```
+
+これで `sys.path` をいじらずどこからでも import できる:
 
 ```python
-import sys
-sys.path.insert(0, "path/to/ketsugecam")
 import ketsugecam
+print(ketsugecam.__version__)
 ```
+
+> **注意**: 過去に `ketsugecam/` を site-packages へ手でコピーしていると、
+> そのコピーが editable インストールを隠してしまう。
+> `python -c "import ketsugecam; print(ketsugecam.__file__)"` が
+> site-packages を指す場合は古いコピーを削除する。
 
 ## 使い方
 
@@ -122,6 +217,74 @@ ketsugecam.create(
 ) -> KetsugeCam
 ```
 
+### `ketsugecam.detector()`
+
+```python
+ketsugecam.detector(
+    model_path: str | None = None,   # .engine / .onnx。相対パスはパッケージ内 -> cwd
+    conf: float = 0.25,              # 信頼度しきい値
+    iou: float = 0.65,               # NMSのIoUしきい値
+    max_det: int = 100,              # 1フレームの最大検出数
+    agnostic_nms: bool = False,      # クラスをまたいでNMSする
+) -> ketsugecam.detect.Detector
+```
+
+| メソッド / プロパティ | 説明 |
+|---|---|
+| `predict(frame)` | 1フレーム推論。`list[Detection]` を返す (`__call__` も同じ) |
+| `draw(img, dets)` | numpy BGR画像に枠・信頼度・中心点を描き込む (その場で書き換え) |
+| `names` | クラス名 (モデルのメタデータ由来) |
+| `imgsz` | モデルの入力サイズ `(幅, 高さ)` |
+| `version` | 自動判別した `V8` / `V11` / `V26` |
+| `conf` / `iou` / `max_det` | 実行中に書き換え可 |
+| `yolo` | 下位の検出器 (CUDAグラフ・サバイバーバッファなど) |
+
+`Detection` は `xyxy` (int 4つ)・`conf`・`cls`・`name`・`center`・`xywh` を持つ。
+
+### `ketsugecam.run()`
+
+```python
+ketsugecam.run(
+    capture_size: tuple[int, int] = (416, 416),
+    model_path: str | None = None,
+    detect: bool = True,
+    show_window: bool = True,
+    draw_boxes: bool = True,
+    show_fps: bool = True,
+) -> None
+```
+
+キャプチャ + YOLO検出 + 表示を起動する。INSERT / ESC で終了。
+上の「キャプチャ + YOLO検出を丸ごと動かす」を参照。
+
+### `ketsugecam.monitor_size()`
+
+```python
+ketsugecam.monitor_size(
+    output_idx: int = 0,   # モニター番号
+    device_idx: int = 0,   # GPUアダプター番号
+) -> tuple[int, int]       # (width, height)
+```
+
+DXGIが報告する複製面のサイズ。`GetSystemMetrics` と違いDPIスケーリングの影響を受けない。
+`region` を自分で計算するとき用。
+
+```python
+w, h = ketsugecam.monitor_size()
+cam = ketsugecam.create(region=((w - 416) // 2, (h - 416) // 2,
+                                (w + 416) // 2, (h + 416) // 2))
+```
+
+### `ketsugecam.list_monitors()`
+
+```python
+ketsugecam.list_monitors(device_idx: int = 0) -> list[tuple[int, int, int, int]]
+```
+
+モニターごとのデスクトップ座標 `(left, top, right, bottom)` を列挙する。
+D3D11デバイスを作らないので、`create()` の前に呼んでもCUDAコンテキストの
+初期化順序に影響しない。
+
 ### `KetsugeCam`
 
 | メソッド / プロパティ | 説明 |
@@ -129,7 +292,7 @@ ketsugecam.create(
 | `grab()` | 1フレームキャプチャ。更新なし時は `None` |
 | `start(target_fps)` | 連続キャプチャ開始 (別スレッド) |
 | `stop()` | 連続キャプチャ停止 |
-| `get_latest_frame(timeout)` | 最新フレームをEvent待機で取得 |
+| `get_latest_frame(timeout, copy=False)` | 最新フレームをEvent待機で取得。`copy=True` で使い回しバッファから切り離す |
 | `release()` | リソース解放 |
 | `capture_fps` | 実測FPS |
 | `mode` | `"cuda_interop"` or `"cpu_fallback"` |
