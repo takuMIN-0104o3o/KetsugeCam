@@ -296,6 +296,27 @@ def monitor_size(output_idx: int = 0, device_idx: int = 0) -> Tuple[int, int]:
     return (right - left, bottom - top)
 
 
+class CUDA_MEMCPY2D(ctypes.Structure):
+    _fields_ = [
+        ("srcXInBytes",   ctypes.c_size_t),
+        ("srcY",          ctypes.c_size_t),
+        ("srcMemoryType", ctypes.c_int),   # CU_MEMORYTYPE_ARRAY=3
+        ("srcHost",       ctypes.c_void_p),
+        ("srcDevice",     ctypes.c_uint64),
+        ("srcArray",      ctypes.c_void_p),
+        ("srcPitch",      ctypes.c_size_t),
+        ("dstXInBytes",   ctypes.c_size_t),
+        ("dstY",          ctypes.c_size_t),
+        ("dstMemoryType", ctypes.c_int),   # CU_MEMORYTYPE_DEVICE=2
+        ("dstHost",       ctypes.c_void_p),
+        ("dstDevice",     ctypes.c_uint64),
+        ("dstArray",      ctypes.c_void_p),
+        ("dstPitch",      ctypes.c_size_t),
+        ("WidthInBytes",  ctypes.c_size_t),
+        ("Height",        ctypes.c_size_t),
+    ]
+
+
 # ─── KetsugeCam ───────────────────────────────────────────────────────────────
 class KetsugeCam:
     """
@@ -487,6 +508,22 @@ class KetsugeCam:
             _cuda_driver.cuMemcpy2D_v2.restype  = ctypes.c_int
             _cuda_driver.cuMemcpy2D_v2.argtypes = [ctypes.c_void_p]
 
+            # 毎フレーム使う引数は作り置きして使い回す (Python側の割り当てを削る)
+            self._res_arr  = (ctypes.c_void_p * 1)(self._cuda_res.value)
+            self._res_addr = ctypes.addressof(self._res_arr)
+            self._mip_arr  = ctypes.c_void_p(0)
+            self._cuda_arr = ctypes.c_void_p(0)
+            self._prev_ctx = ctypes.c_void_p(0)
+            cp = CUDA_MEMCPY2D()
+            cp.srcMemoryType = 3          # CU_MEMORYTYPE_ARRAY
+            cp.dstMemoryType = 2          # CU_MEMORYTYPE_DEVICE
+            cp.dstDevice     = self._gpu_ptr
+            cp.dstPitch      = roi_w * 4
+            cp.WidthInBytes  = roi_w * 4
+            cp.Height        = roi_h
+            self._memcpy      = cp
+            self._memcpy_ref  = ctypes.byref(cp)
+
             self._cu_ctx    = cu_ctx
             self._cu_driver = _cuda_driver
             self._interop  = True
@@ -497,14 +534,20 @@ class KetsugeCam:
             self._interop = False
 
     # ── 単発キャプチャ ────────────────────────────────────────────────────────
-    def grab(self) -> Optional[torch.Tensor]:
-        return self._grab()
+    def grab(self, timeout_ms: int = 1) -> Optional[torch.Tensor]:
+        """新フレームを1枚取る。timeout_ms 待っても画面が更新されなければ None。
 
-    def _grab(self) -> Optional[torch.Tensor]:
+        新フレームが来た時点ですぐ戻るので、timeout_ms を大きくしても遅延は
+        増えない (CPUの空回りが減るだけ)。カーソルが動いただけの更新は
+        画像が同じなので None を返す。
+        """
+        return self._grab(timeout_ms)
+
+    def _grab(self, timeout_ms: int = 1) -> Optional[torch.Tensor]:
         res_ptr = ctypes.POINTER(IDXGIResource)()
         try:
             self._dupl.AcquireNextFrame(
-                1,
+                timeout_ms,
                 ctypes.byref(self._frame_info),
                 ctypes.byref(res_ptr),
             )
@@ -516,6 +559,12 @@ class KetsugeCam:
                 self._rebuild_dupl()
                 return None
             raise
+
+        # LastPresentTime == 0: カーソルだけの更新で画面の中身は前と同じ。
+        # 同じ画像で推論すると、その間に来た本物の新フレームが待たされる。
+        if self._frame_info.LastPresentTime == 0:
+            self._dupl.ReleaseFrame()
+            return None
 
         try:
             src_tex = res_ptr.QueryInterface(ID3D11Texture2D)
@@ -547,82 +596,36 @@ class KetsugeCam:
         # D3D11側のコンテキストがカレントのまま使うと
         # cudaErrorInvalidResourceHandle になる。grab() の直後に
         # 同じスレッドで推論する使い方 (ketsugecam.detector 等) のため。
-        prev_ctx = ctypes.c_void_p(0)
-        try:
-            cu.cuCtxGetCurrent(ctypes.byref(prev_ctx))
-        except Exception:
-            prev_ctx = ctypes.c_void_p(0)
+        prev_ctx = self._prev_ctx
+        prev_ctx.value = 0
+        cu.cuCtxGetCurrent(ctypes.byref(prev_ctx))
         cu.cuCtxSetCurrent(self._cu_ctx.value)
 
-        res_val = self._cuda_res.value
-        res_arr = (ctypes.c_void_p * 1)(res_val)
-
-        err = cu.cuGraphicsMapResources(1, ctypes.addressof(res_arr), None)
+        res_addr = self._res_addr
+        err = cu.cuGraphicsMapResources(1, res_addr, None)
         if err != 0:
             raise RuntimeError(f"cuGraphicsMapResources failed: {err}")
         try:
-            # cuGraphicsResourceGetMappedMipmappedArray
-            mip_arr = ctypes.c_void_p(0)
             err = cu.cuGraphicsResourceGetMappedMipmappedArray(
-                ctypes.byref(mip_arr), self._cuda_res
+                ctypes.byref(self._mip_arr), self._cuda_res
             )
             if err != 0:
                 raise RuntimeError(f"GetMappedMipmappedArray failed: {err}")
 
-            # cuMipmappedArrayGetLevel
-            cuda_arr = ctypes.c_void_p(0)
             err = cu.cuMipmappedArrayGetLevel(
-                ctypes.byref(cuda_arr), mip_arr, 0
+                ctypes.byref(self._cuda_arr), self._mip_arr, 0
             )
             if err != 0:
                 raise RuntimeError(f"cuMipmappedArrayGetLevel failed: {err}")
 
-            # cuMemcpy2D: cudaArray → GPU buffer
-            # CUDA_MEMCPY2D 構造体
-            class CUDA_MEMCPY2D(ctypes.Structure):
-                _fields_ = [
-                    ("srcXInBytes",   ctypes.c_size_t),
-                    ("srcY",          ctypes.c_size_t),
-                    ("srcMemoryType", ctypes.c_int),   # CU_MEMORYTYPE_ARRAY=3
-                    ("srcHost",       ctypes.c_void_p),
-                    ("srcDevice",     ctypes.c_uint64),
-                    ("srcArray",      ctypes.c_void_p),
-                    ("srcPitch",      ctypes.c_size_t),
-                    ("dstXInBytes",   ctypes.c_size_t),
-                    ("dstY",          ctypes.c_size_t),
-                    ("dstMemoryType", ctypes.c_int),   # CU_MEMORYTYPE_DEVICE=2
-                    ("dstHost",       ctypes.c_void_p),
-                    ("dstDevice",     ctypes.c_uint64),
-                    ("dstArray",      ctypes.c_void_p),
-                    ("dstPitch",      ctypes.c_size_t),
-                    ("WidthInBytes",  ctypes.c_size_t),
-                    ("Height",        ctypes.c_size_t),
-                ]
-
-            cp = CUDA_MEMCPY2D()
-            cp.srcXInBytes   = 0
-            cp.srcY          = 0
-            cp.srcMemoryType = 3          # CU_MEMORYTYPE_ARRAY
-            cp.srcHost       = None
-            cp.srcDevice     = 0
-            cp.srcArray      = cuda_arr
-            cp.srcPitch      = 0
-            cp.dstXInBytes   = 0
-            cp.dstY          = 0
-            cp.dstMemoryType = 2          # CU_MEMORYTYPE_DEVICE
-            cp.dstHost       = None
-            cp.dstDevice     = self._gpu_ptr
-            cp.dstArray      = None
-            cp.dstPitch      = self._roi_w * 4
-            cp.WidthInBytes  = self._roi_w * 4
-            cp.Height        = self._roi_h
-
-            err = cu.cuMemcpy2D_v2(ctypes.byref(cp))
+            # cuMemcpy2D: cudaArray → GPU buffer (構造体は作り置き)
+            self._memcpy.srcArray = self._cuda_arr.value
+            err = cu.cuMemcpy2D_v2(self._memcpy_ref)
             if err != 0:
                 raise RuntimeError(f"cuMemcpy2D_v2 failed: {err}")
 
         finally:
-            cu.cuGraphicsUnmapResources(1, ctypes.addressof(res_arr), None)
+            cu.cuGraphicsUnmapResources(1, res_addr, None)
             if prev_ctx.value and prev_ctx.value != self._cu_ctx.value:
                 cu.cuCtxSetCurrent(prev_ctx)
 
