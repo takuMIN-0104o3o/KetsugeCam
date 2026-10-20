@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -1191,3 +1192,64 @@ class Detector:
             if center_dot:
                 cv2.circle(image, d.center, 3, (0, 0, 255), -1)
         return image
+
+
+def _resolve_from_caller(path: str, caller_file: Optional[str]) -> str:
+    """相対パスを 呼び出し元スクリプトのフォルダ -> カレント -> パッケージ内 の順で探す。"""
+    if not path or os.path.isabs(path):
+        return path
+    if caller_file and not caller_file.startswith("<"):
+        candidate = os.path.join(os.path.dirname(os.path.abspath(caller_file)), path)
+        if os.path.exists(candidate):
+            return candidate
+    if os.path.exists(path):
+        return os.path.abspath(path)
+    return resolve_model_path(path)
+
+
+class YOLO(Detector):
+    """ultralytics 風の書き方で使う検出器。
+
+        from ketsugecam import YOLO
+
+        model_yolo = YOLO("best.engine")
+        dets = model_yolo(frame, conf=0.35, iou=0.45, max_det=5)
+
+    相対パスは「YOLO() を呼んだスクリプトのフォルダ -> カレント -> ketsugecam/ 内」
+    の順で探す。main.py の隣に置いたモデルがそのまま使える。
+
+    predict() / __call__ の conf / iou / max_det / agnostic_nms はその呼び出しだけ
+    有効 (ultralytics と同じ)。省略するとコンストラクタ (または属性) の値。
+    返り値は Detection のリスト (ultralytics の Results ではない)。
+    """
+
+    def __init__(self, model: str = "best.engine",
+                 conf: float = 0.25,
+                 iou: float = 0.65,
+                 max_det: int = 100,
+                 agnostic_nms: bool = False) -> None:
+        caller = sys._getframe(1).f_code.co_filename
+        self.model_path = _resolve_from_caller(model, caller)
+        super().__init__(self.model_path, conf=conf, iou=iou, max_det=max_det,
+                         agnostic_nms=agnostic_nms)
+
+    def predict(self, frame, conf: Optional[float] = None,
+                iou: Optional[float] = None, max_det: Optional[int] = None,
+                agnostic_nms: Optional[bool] = None) -> List[Detection]:
+        y = self.yolo
+        saved = (y.PROBABILITY_THRESHOLD, y.NMS_THRESHOLD, y.TOP_K, y.AGNOSTIC_NMS)
+        if conf is not None:
+            y.PROBABILITY_THRESHOLD = float(conf)
+        if iou is not None:
+            y.NMS_THRESHOLD = float(iou)
+        if max_det is not None:
+            y.TOP_K = int(max_det)
+        if agnostic_nms is not None:
+            y.AGNOSTIC_NMS = bool(agnostic_nms)
+        try:
+            return super().predict(frame)
+        finally:
+            (y.PROBABILITY_THRESHOLD, y.NMS_THRESHOLD, y.TOP_K,
+             y.AGNOSTIC_NMS) = saved
+
+    __call__ = predict

@@ -77,6 +77,45 @@ while True:
 
 動く例は[リポジトリ直下の `main.py`](../main.py) (検出スレッド + pygame表示)。
 
+### 遅延を最小にする
+
+`cam.start()` + `get_latest_frame()` はキャプチャスレッドのタイマー周期ぶん
+(400fps なら最大 2.5ms) 待ちが入る。遅延を詰めるなら `start()` を呼ばずに、
+検出するスレッドで `grab()` を直接呼ぶ:
+
+```python
+cam   = ketsugecam.create(region=(752, 332, 1168, 748))   # start() は呼ばない
+model = ketsugecam.detector("best.engine", conf=0.35, iou=0.45, max_det=5)
+
+while True:
+    frame = cam.grab(timeout_ms=100)   # 新フレームが来た瞬間に戻る
+    if frame is None:
+        continue
+    dets = model.predict(frame)        # 次の grab() より前に終わるので copy 不要
+```
+
+このループを別スレッドで回すときは、最初の `grab()` の前にそのスレッドで
+`torch.cuda.synchronize()` を一度呼ぶ。`grab()` は「呼ぶ前のコンテキスト」に戻すが、
+新しいスレッドには最初どのコンテキストも無いので D3D11 側が残り、`predict()` が
+`CUDA error: invalid resource handle` で落ちる。
+
+| 対策 | 削れる遅延 |
+|---|---|
+| `start()` を使わず `grab()` を直接呼ぶ | タイマー待ち (最大 1周期) とスレッド間の受け渡し |
+| 表示用の `.cpu()` は表示スレッドで。検出側は要求時だけ `frame.clone()` | 毎フレームの GPU→CPU 転送 |
+| 起動時に `predict()` を数回呼ぶ | 初回の CUDA グラフキャプチャ (数十 ms) |
+| `sys.setswitchinterval(0.0005)` | GIL の切り替え待ち (既定 最大 5ms) |
+| プロセス HIGH / 検出スレッド TIME_CRITICAL / `timeBeginPeriod(1)` | OS のスケジューリング待ち |
+
+`grab()` 直後の `cam._frame_info.LastPresentTime` は、そのフレームが画面に出た
+時刻 (QPC)。`QueryPerformanceCounter` との差で「画面に出てから検出結果が出るまで」
+の実遅延が測れる。
+
+コードで消せないのは、画面の更新間隔 (144Hz で 6.9ms) と推論時間そのもの
+(モデルの大きさ・`imgsz`・FP16 で決まる) だけ。
+
+全部入りの例: `新しいフォルダー/main.py`
+
 ### フォルダの中身
 
 | ファイル | 役割 |

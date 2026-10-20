@@ -167,10 +167,19 @@ def run(
          show_fps=show_fps)
 
 
+def __getattr__(name):
+    # 遅延import: `from ketsugecam import YOLO` したときだけ tensorrt を読み込む。
+    if name == "YOLO":
+        from .detect import YOLO
+        return YOLO
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "create",
     "run",
     "detector",
+    "YOLO",
     "KetsugeCam",
     "list_monitors",
     "monitor_size",

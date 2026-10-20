@@ -87,6 +87,15 @@ while True:
         print(d.name, d.conf, d.xyxy, d.center)
 ```
 
+ultralytics 風に書くこともできる:
+
+```python
+from ketsugecam import YOLO
+
+model_yolo = YOLO("best.engine")                    # スクリプトの隣 -> カレント -> ketsugecam/ 内
+dets = model_yolo(frame, conf=0.35, iou=0.45, max_det=5)   # 引数はその呼び出しだけ有効
+```
+
 前処理・NMS は中でやるので、`frame` をそのまま渡すだけ。
 numpy の BGR 画像を渡してもよい。
 
@@ -151,6 +160,58 @@ cam1 = ketsugecam.create(output_idx=1)     # 2枚目のモニター
 
 GPU が複数あるときは `device_idx` で選ぶ。
 
+## 7. 遅延を最小にする
+
+`cam.start()` + `get_latest_frame()` は手軽だが、キャプチャスレッドのタイマー周期ぶん
+(400fps なら最大 2.5ms) 待ちが入る。遅延を詰めるなら `start()` を呼ばずに、
+検出するスレッドで `grab()` を直接呼ぶ:
+
+```python
+cam   = ketsugecam.create(region=(752, 332, 1168, 748))   # start() は呼ばない
+model = ketsugecam.detector("best.engine", conf=0.35, iou=0.45, max_det=5)
+
+while True:
+    frame = cam.grab(timeout_ms=100)   # 新フレームが来た瞬間に戻る
+    if frame is None:
+        continue
+    dets = model.predict(frame)        # 次の grab() より前に終わるので copy 不要
+```
+
+**このループを別スレッドで回すときは、最初の `grab()` の前に
+`torch.cuda.synchronize()` を一度呼ぶ。** `grab()` は「呼ぶ前のコンテキスト」に
+戻すが、新しいスレッドには最初どのコンテキストも無いので、D3D11 側のコンテキストが
+残ったままになり、`predict()` が `CUDA error: invalid resource handle` で落ちる。
+
+```python
+def detection_thread():
+    torch.cuda.synchronize()           # torch のコンテキストをこのスレッドでカレントに
+    while True:
+        frame = cam.grab(timeout_ms=100)
+        ...
+```
+
+ほかに効くこと:
+
+- **表示用の `.cpu()` を検出ループに入れない。** 表示側が欲しいときだけ
+  `frame.clone()` (GPU 上で非同期、数µs) を渡し、`.cpu()` は表示スレッドでやる
+- **起動時にウォームアップする。** 最初の `predict()` は CUDA グラフのキャプチャで
+  数十 ms かかるので、本番前に数回呼んでおく
+- **GIL の切り替え待ちを短くする。** `sys.setswitchinterval(0.0005)`
+  (既定 5ms。表示スレッドが GIL を握っている間、検出スレッドが待たされる)
+- **Windows の優先度を上げる。** プロセスを HIGH、検出スレッドを TIME_CRITICAL、
+  `timeBeginPeriod(1)`
+
+遅延の測り方: `grab()` 直後の `cam._frame_info.LastPresentTime` は、そのフレームが
+画面に出た時刻 (QPC)。`QueryPerformanceCounter` との差で「画面に出てから検出結果が
+出るまで」が測れる。
+
+コードでは消せない遅延:
+
+- 画面の更新間隔 (144Hz なら 6.9ms、240Hz なら 4.2ms)
+- 推論時間そのもの (モデルの大きさ・`imgsz`・FP16 で決まる)
+
+全部入りの例 (検出スレッド + pygame 表示): `新しいフォルダー/main.py`
+
 ---
 
 ## 早見表
@@ -158,7 +219,7 @@ GPU が複数あるときは `device_idx` で選ぶ。
 | 関数 / メソッド | 説明 |
 |---|---|
 | `ketsugecam.create(output_idx=0, device_idx=0, region=None)` | カメラを作る |
-| `cam.grab()` | 1枚撮る。変化なしなら `None` |
+| `cam.grab(timeout_ms=1)` | 1枚撮る。変化なしなら `None`。新フレーム到着で即戻る (最小遅延) |
 | `cam.start(target_fps)` / `cam.stop()` | 連続キャプチャの開始 / 停止 |
 | `cam.get_latest_frame(timeout=1.0, copy=False)` | 最新フレームを取る |
 | `cam.release()` | 後片付け |
