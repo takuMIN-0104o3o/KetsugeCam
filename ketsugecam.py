@@ -376,6 +376,12 @@ class KetsugeCam:
         self._frame_info = DXGI_OUTDUPL_FRAME_INFO()
         self._rect       = DXGI_MAPPED_RECT()
 
+        # 最後に grab() したフレームを DXGI から受け取った瞬間の QPC
+        # (AcquireNextFrame が戻った直後。LastPresentTime と同じ時計)
+        self.acquire_qpc = 0
+        self._qpc_buf    = ctypes.c_int64()
+        self._qpc        = ctypes.windll.kernel32.QueryPerformanceCounter
+
         # ── CUDA interop 初期化 ──
         # ★ torch.cuda.is_available() より先に呼ぶ
         # PyTorchがCUDAコンテキストを作る前にD3D11と紐付ける必要がある
@@ -551,6 +557,7 @@ class KetsugeCam:
                 ctypes.byref(self._frame_info),
                 ctypes.byref(res_ptr),
             )
+            self._qpc(ctypes.byref(self._qpc_buf))
         except comtypes.COMError as e:
             code = ctypes.c_int32(e.args[0]).value
             if code == ctypes.c_int32(DXGI_ERROR_WAIT_TIMEOUT).value:
@@ -565,6 +572,7 @@ class KetsugeCam:
         if self._frame_info.LastPresentTime == 0:
             self._dupl.ReleaseFrame()
             return None
+        self.acquire_qpc = self._qpc_buf.value
 
         try:
             src_tex = res_ptr.QueryInterface(ID3D11Texture2D)
