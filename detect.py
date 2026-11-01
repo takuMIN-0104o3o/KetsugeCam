@@ -118,7 +118,7 @@ class Options:
 
 
 # TensorRT logs every severity through, matching the C++ Logger.
-LOGGER = trt.Logger(trt.Logger.VERBOSE)
+LOGGER = trt.Logger(trt.Logger.WARNING)
 
 _TRT_TO_TORCH = {
     trt.DataType.FLOAT: torch.float32,
